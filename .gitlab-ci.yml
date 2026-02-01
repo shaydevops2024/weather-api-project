@@ -1,0 +1,262 @@
+stages:
+  - test
+  - build
+  - deploy
+  - integration-test
+
+variables:
+  DOCKER_IMAGE: weather-api
+  DOCKER_TAG: $CI_COMMIT_SHORT_SHA
+  KIND_CLUSTER_NAME: weather-api-ci
+  NAMESPACE: weather-api
+
+# Cache pip dependencies between jobs
+.python-cache: &python-cache
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - .cache/pip
+
+# ----- TEST STAGE -----
+lint:
+  stage: test
+  image: python:3.11-slim
+  <<: *python-cache
+  before_script:
+    - pip install --cache-dir=.cache/pip flake8 black
+  script:
+    - flake8 app/ --max-line-length=120 --ignore=E501,W503
+    - black app/ --check --diff
+  allow_failure: true
+
+unit-test:
+  stage: test
+  image: python:3.11-slim
+  <<: *python-cache
+  before_script:
+    - pip install --cache-dir=.cache/pip -r requirements.txt
+    - pip install --cache-dir=.cache/pip pytest pytest-asyncio httpx
+  script:
+    - uvicorn app.main:app --host 0.0.0.0 --port 8000 &
+    - sleep 3
+    - pytest tests/ -v --tb=short
+
+# ----- BUILD & DEPLOY STAGE (with kind cluster) -----
+build-and-deploy:
+  stage: build
+  image: docker:24
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_VERIFY: 1
+    DOCKER_CERT_PATH: "$DOCKER_TLS_CERTDIR/client"
+  before_script:
+    # Install required tools
+    - apk add --no-cache curl bash kubectl helm
+    # Install kind
+    - curl -Lo /usr/local/bin/kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+    - chmod +x /usr/local/bin/kind
+  script:
+    # Wait for Docker to be ready
+    - until docker info; do sleep 1; done
+
+    # Create kind cluster with 'docker' in certificate SANs
+    - |
+      cat <<EOF | kind create cluster --name $KIND_CLUSTER_NAME --config=-
+      kind: Cluster
+      apiVersion: kind.x-k8s.io/v1alpha4
+      networking:
+        apiServerAddress: "0.0.0.0"
+      nodes:
+        - role: control-plane
+          extraPortMappings:
+            - containerPort: 30080
+              hostPort: 8000
+              protocol: TCP
+          kubeadmConfigPatches:
+            - |
+              kind: ClusterConfiguration
+              apiServer:
+                certSANs:
+                  - "docker"
+                  - "localhost"
+                  - "127.0.0.1"
+                  - "0.0.0.0"
+      EOF
+
+    # Fix kubeconfig to work with Docker-in-Docker
+    - sed -i 's|https://0\.0\.0\.0:|https://docker:|g' ~/.kube/config
+    - sed -i 's|https://127\.0\.0\.1:|https://docker:|g' ~/.kube/config
+    - cat ~/.kube/config | grep server
+    - kubectl cluster-info
+
+    # Build Docker image
+    - docker build -t $DOCKER_IMAGE:$DOCKER_TAG -t $DOCKER_IMAGE:latest .
+
+    # Load image into kind cluster
+    - kind load docker-image $DOCKER_IMAGE:$DOCKER_TAG --name $KIND_CLUSTER_NAME
+
+    # Create namespace
+    - kubectl create namespace $NAMESPACE || true
+
+    # Deploy using Helm (app only, skip monitoring for CI speed)
+    - |
+      helm upgrade --install weather-api ./helm/weather-api \
+        --namespace $NAMESPACE \
+        --set image.repository=$DOCKER_IMAGE \
+        --set image.tag=$DOCKER_TAG \
+        --set image.pullPolicy=Never \
+        --set service.type=NodePort \
+        --set service.nodePort=30080 \
+        --set prometheus.enabled=false \
+        --set grafana.enabled=false \
+        --wait --timeout=120s
+
+    # Verify deployment
+    - kubectl get pods -n $NAMESPACE
+    - kubectl get svc -n $NAMESPACE
+
+    # Save cluster config for next stage
+    - kind get kubeconfig --name $KIND_CLUSTER_NAME > kubeconfig.yaml
+  artifacts:
+    paths:
+      - kubeconfig.yaml
+    expire_in: 1 hour
+  after_script:
+    # Cleanup (runs even if job fails)
+    - kind delete cluster --name $KIND_CLUSTER_NAME || true
+
+# ----- INTEGRATION TEST STAGE -----
+integration-test:
+  stage: integration-test
+  image: docker:24
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_VERIFY: 1
+    DOCKER_CERT_PATH: "$DOCKER_TLS_CERTDIR/client"
+  before_script:
+    - apk add --no-cache curl bash kubectl helm
+    - curl -Lo /usr/local/bin/kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+    - chmod +x /usr/local/bin/kind
+  script:
+    # Wait for Docker
+    - until docker info; do sleep 1; done
+
+    # Create kind cluster with 'docker' in certificate SANs
+    - |
+      cat <<EOF | kind create cluster --name $KIND_CLUSTER_NAME --config=-
+      kind: Cluster
+      apiVersion: kind.x-k8s.io/v1alpha4
+      networking:
+        apiServerAddress: "0.0.0.0"
+      nodes:
+        - role: control-plane
+          extraPortMappings:
+            - containerPort: 30080
+              hostPort: 8000
+              protocol: TCP
+          kubeadmConfigPatches:
+            - |
+              kind: ClusterConfiguration
+              apiServer:
+                certSANs:
+                  - "docker"
+                  - "localhost"
+                  - "127.0.0.1"
+                  - "0.0.0.0"
+      EOF
+
+    # Fix kubeconfig to work with Docker-in-Docker
+    - sed -i 's|https://0\.0\.0\.0:|https://docker:|g' ~/.kube/config
+    - sed -i 's|https://127\.0\.0\.1:|https://docker:|g' ~/.kube/config
+    - cat ~/.kube/config | grep server
+    - kubectl cluster-info
+
+    # Build and load image
+    - docker build -t $DOCKER_IMAGE:$DOCKER_TAG .
+    - kind load docker-image $DOCKER_IMAGE:$DOCKER_TAG --name $KIND_CLUSTER_NAME
+
+    # Deploy
+    - kubectl create namespace $NAMESPACE || true
+    - |
+      helm upgrade --install weather-api ./helm/weather-api \
+        --namespace $NAMESPACE \
+        --set image.repository=$DOCKER_IMAGE \
+        --set image.tag=$DOCKER_TAG \
+        --set image.pullPolicy=Never \
+        --set service.type=NodePort \
+        --set service.nodePort=30080 \
+        --set prometheus.enabled=false \
+        --set grafana.enabled=false \
+        --wait --timeout=120s
+
+    # Wait for pod to be ready
+    - kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=weather-api -n $NAMESPACE --timeout=60s
+
+    # Use 'docker' hostname with the mapped hostPort (8000) from kind config
+    - export API_URL="http://docker:8000"
+    - echo "Testing API at $API_URL"
+
+    # Run integration tests
+    - |
+      echo "=== Test 1: Health Check ==="
+      HEALTH=$(curl -sf "$API_URL/health" || echo "FAILED")
+      echo "$HEALTH"
+      echo "$HEALTH" | grep -q "healthy" || (echo "Health check failed!" && exit 1)
+
+    - |
+      echo "=== Test 2: Root Endpoint ==="
+      ROOT=$(curl -sf "$API_URL/" || echo "FAILED")
+      echo "$ROOT"
+      echo "$ROOT" | grep -q "Weather Coordinates API" || (echo "Root endpoint failed!" && exit 1)
+
+    - |
+      echo "=== Test 3: Get All Coordinates ==="
+      COORDS=$(curl -sf "$API_URL/coordinates" || echo "FAILED")
+      echo "$COORDS"
+      echo "$COORDS" | grep -q "tel-aviv" || (echo "Coordinates endpoint failed!" && exit 1)
+      echo "$COORDS" | grep -q "beer-sheva" || (echo "Missing beer-sheva!" && exit 1)
+      echo "$COORDS" | grep -q "jerusalem" || (echo "Missing jerusalem!" && exit 1)
+      echo "$COORDS" | grep -q "szeged" || (echo "Missing szeged!" && exit 1)
+
+    - |
+      echo "=== Test 4: Get Single City (Tel Aviv) ==="
+      TELAVIV=$(curl -sf "$API_URL/coordinates/tel-aviv" || echo "FAILED")
+      echo "$TELAVIV"
+      echo "$TELAVIV" | grep -q "latitude" || (echo "Tel Aviv endpoint failed!" && exit 1)
+
+    - |
+      echo "=== Test 5: Get Single City (Jerusalem) ==="
+      JERUSALEM=$(curl -sf "$API_URL/coordinates/jerusalem" || echo "FAILED")
+      echo "$JERUSALEM"
+      echo "$JERUSALEM" | grep -q "latitude" || (echo "Jerusalem endpoint failed!" && exit 1)
+
+    - |
+      echo "=== Test 6: Prometheus Metrics ==="
+      METRICS=$(curl -sf "$API_URL/metrics" || echo "FAILED")
+      echo "$METRICS" | head -20
+      echo "$METRICS" | grep -q "api_requests_total" || (echo "Metrics endpoint failed!" && exit 1)
+
+    - |
+      echo "=== Test 7: Invalid City (404 expected) ==="
+      INVALID=$(curl -s -o /dev/null -w "%{http_code}" "$API_URL/coordinates/invalid-city")
+      echo "Status code: $INVALID"
+      [ "$INVALID" = "404" ] || (echo "Expected 404, got $INVALID" && exit 1)
+
+    - |
+      echo "=== Test 8: Cache Verification ==="
+      # First request populates cache
+      curl -sf "$API_URL/coordinates" > /dev/null
+      # Second request should be cached
+      CACHED=$(curl -sf "$API_URL/coordinates")
+      echo "$CACHED"
+      echo "$CACHED" | grep -q '"cached": true' || echo "Cache may not be working (this is informational)"
+
+    - echo "=== All integration tests passed! ==="
+  after_script:
+    - kind delete cluster --name $KIND_CLUSTER_NAME || true
