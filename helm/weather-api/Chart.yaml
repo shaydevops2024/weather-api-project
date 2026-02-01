@@ -1,0 +1,23 @@
+apiVersion: v2
+name: weather-api
+description: A Helm chart for Weather API with Prometheus and Grafana monitoring
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+keywords:
+  - weather
+  - api
+  - fastapi
+  - prometheus
+  - grafana
+maintainers:
+  - name: DevOps Team
+dependencies:
+  - name: prometheus
+    version: "25.8.0"
+    repository: "https://prometheus-community.github.io/helm-charts"
+    condition: prometheus.enabled
+  - name: grafana
+    version: "7.0.8"
+    repository: "https://grafana.github.io/helm-charts"
+    condition: grafana.enabled
